@@ -198,10 +198,140 @@ class TransformerBlockSelectiveBatchingTP(Operator):
             latency += comm_latency
 
         return latency
+    
+    def compile_and_simulate(self, system, compile_mode='heuristic'):
+        """
+        使用硬件模拟器 (Systolic Array Simulator) 计算延迟。
+        """
+        device = system.device
+        interconnect = system.interconnect
+        
+        latency = 0.0
+        # 获取 overhead 配置
+        oh = device.compute_module.overhead 
 
-    def __call__(self, batch_requests, system):
+        # 1. Linear Parts
+        # Q, K, V
+        latency += 3 * (self.Q_proj.compile_and_simulate(device, compile_mode) + oh.matmul)
+        # Projections
+        latency += (self.H_matmul0.compile_and_simulate(device, compile_mode) + oh.matmul)
+        latency += (self.H_matmul1.compile_and_simulate(device, compile_mode) + oh.matmul)
+        latency += (self.H_matmul2.compile_and_simulate(device, compile_mode) + oh.matmul)
+        
+        # Norms & Act
+        latency += 2 * (self.layer_norm0.compile_and_simulate(device, compile_mode) + oh.layernorm)
+        latency += (self.H_gelu.compile_and_simulate(device, compile_mode) + oh.gelu)
+
+        # 2. Attention Parts
+        # 必须遍历每个请求，更新 shape 后再模拟
+        attn_latency = 0.0
+        h_per_dev = self.n_heads // self.device_count
+        
+        for req in self.request_meta:
+            q_len = req['query_len']
+            k_len = req['seq_len']
+            
+            # 构造 Tensor
+            q_tensor = Tensor([1, h_per_dev, q_len, self.d_h], self.data_type)
+            k_tensor_T = Tensor([1, h_per_dev, self.d_h, k_len], self.data_type)
+            attn_score = Tensor([1, h_per_dev, q_len, k_len], self.data_type)
+            v_tensor = Tensor([1, h_per_dev, k_len, self.d_h], self.data_type)
+
+            # Score Calculation (Q * K)
+            self.Attn_Q_mul_K(q_tensor, k_tensor_T) # 更新 shape
+            attn_latency += self.Attn_Q_mul_K.compile_and_simulate(device, compile_mode) + oh.matmul
+            
+            # Softmax
+            self.Attn_Softmax(attn_score) # 更新 shape
+            attn_latency += self.Attn_Softmax.compile_and_simulate(device, compile_mode) + oh.softmax
+            
+            # Value Aggregation (Score * V)
+            self.Attn_A_mul_V(attn_score, v_tensor) # 更新 shape
+            attn_latency += self.Attn_A_mul_V.compile_and_simulate(device, compile_mode) + oh.matmul
+
+        latency += attn_latency
+
+        # 3. Communication
+        if self.device_count > 1 and interconnect is not None:
+            # AllReduce 的 simulate 方法在基类中是一样的，不需要 compile_and_simulate
+            comm_latency = self.allreduce_mha.simulate(interconnect)
+            latency += comm_latency * 2
+
+        return latency
+
+    def run_on_gpu(self):
         """
-        统一入口：更新负载 -> 计算延迟
+        基于真实 GPU 运行或 Profiling 数据的延迟。
         """
+        latency = 0.0
+        
+        # 1. Linear Parts
+        latency += 3 * self.Q_proj.run_on_gpu()
+        latency += self.H_matmul0.run_on_gpu()
+        latency += self.H_matmul1.run_on_gpu()
+        latency += self.H_matmul2.run_on_gpu()
+        
+        latency += 2 * self.layer_norm0.run_on_gpu()
+        latency += self.H_gelu.run_on_gpu()
+
+        # 2. Attention Parts
+        attn_latency = 0.0
+        h_per_dev = self.n_heads // self.device_count
+        
+        for req in self.request_meta:
+            q_len = req['query_len']
+            k_len = req['seq_len']
+            
+            q_tensor = Tensor([1, h_per_dev, q_len, self.d_h], self.data_type)
+            k_tensor_T = Tensor([1, h_per_dev, self.d_h, k_len], self.data_type)
+            attn_score = Tensor([1, h_per_dev, q_len, k_len], self.data_type)
+            v_tensor = Tensor([1, h_per_dev, k_len, self.d_h], self.data_type)
+
+            # 必须调用 __call__ 更新 shape，因为 run_on_gpu 内部可能依赖 input_shape 来查表
+            self.Attn_Q_mul_K(q_tensor, k_tensor_T)
+            attn_latency += self.Attn_Q_mul_K.run_on_gpu()
+            
+            self.Attn_Softmax(attn_score)
+            attn_latency += self.Attn_Softmax.run_on_gpu()
+            
+            self.Attn_A_mul_V(attn_score, v_tensor)
+            attn_latency += self.Attn_A_mul_V.run_on_gpu()
+
+        latency += attn_latency
+
+        # 3. Communication
+        # 参照 transformer.py，run_on_gpu 通常不包含 AllReduce 延迟 (设为0)
+        # 因为单卡 Profiling 无法测量多卡通信
+        allreduce_total_latency = 0
+        latency += allreduce_total_latency
+
+        self.latency_on_gpu = latency
+        return self.latency_on_gpu
+
+    def __call__(self, batch_requests, system, mode='roofline', compile_mode='heuristic'):
+        """
+        统一入口。
+        Args:
+            batch_requests: 请求列表
+            system: 硬件系统对象
+            mode: 计算模式 ('roofline', 'simulate', 'gpu')
+            compile_mode: 仅在 mode='simulate' 时有效，传递给底层模拟器
+        """
+        # 1. 更新算子负载 (Shape)
         self.update_workload(batch_requests)
-        return self.roofline_model(system)
+
+        # 2. 根据模式分发
+        if mode == 'roofline':
+            # 默认模式：基于公式
+            return self.roofline_model(system)
+            
+        elif mode == 'simulate':
+            # 模拟模式：速度较慢，基于 Systolic Array 行为模拟
+            return self.compile_and_simulate(system, compile_mode=compile_mode)
+            
+        elif mode == 'gpu':
+            # 实机/查表模式：基于本地 GPU 或 Profiling 数据
+            return self.run_on_gpu()
+            
+        else:
+            raise ValueError(f"Unknown execution mode: {mode}. Supported: 'roofline', 'simulate', 'gpu'")

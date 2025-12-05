@@ -3,7 +3,14 @@ import os
 import csv
 import json
 import pandas as pd
+# --- 在Windows环境下测试run_on_gpu需要跳过triton优化 ---
+import torch
 
+# --- [新增修复代码] 解决 Windows 下 Triton 报错问题 ---
+import torch._dynamo
+# 强制让 PyTorch 忽略编译错误，自动回退到普通运行模式 (Eager Mode)
+torch._dynamo.config.suppress_errors = True
+# --- [修复代码结束] ---
 # 添加当前路径
 sys.path.append(os.getcwd())
 
@@ -165,7 +172,13 @@ def run_test():
     except Exception as e:
         print(f"Error loading hardware: {e}")
         return
+    real_memory_bytes = system.device.memory_module.memory_capacity
     
+    # 转换为 GB 并打印
+    real_memory_gb = real_memory_bytes / 1e9
+    
+    print(f"Detected Hardware Memory: {real_memory_gb:.2f} GB")
+
     # 3. 初始化后端
     print("Initializing Backend...")
     backend = TransformerBlockSelectiveBatchingTP(
@@ -183,7 +196,7 @@ def run_test():
             max_batch=64,
             npu_num=1,
             npu_group=1,
-            npu_mem=40,
+            npu_mem=real_memory_gb,
             fp=16,
             block_size=16,
             req_num=10000,
@@ -258,7 +271,12 @@ def run_test():
         # ... (后续计算延迟的代码保持不变) ...
         # 计算延迟
         try:
+            # 三种模式选择：选用一种方法，注释掉另外两种方法
+            #layer_latency_sec = backend(batch.requests, system)
+            print("Running with Systolic Array Simulator...")
             layer_latency_sec = backend(batch.requests, system)
+            #print("Running with Real GPU Profiling...")
+            #layer_latency_sec = backend(batch.requests, system, mode='gpu')
         except AttributeError as e:
             print(f"Backend Error: {e}")
             raise e
